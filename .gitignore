@@ -1,0 +1,19 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local database and generated data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated reports
+reports/
