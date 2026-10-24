@@ -6,7 +6,14 @@ from collections import Counter, defaultdict
 from math import log
 from pathlib import Path
 
-from src.model import DEFAULT_HALF_LIFE_DAYS, DEFAULT_XG_WEIGHT, FootballModel
+from src.model import (
+    DEFAULT_HALF_LIFE_DAYS,
+    DEFAULT_XG_WEIGHT,
+    FootballModel,
+    brier_score,
+    calibration_buckets,
+    log_loss,
+)
 
 DB_PATH = Path("data/football.db")
 MIN_TRAINING_MATCHES = 100
@@ -67,15 +74,6 @@ def prediction_probabilities(prediction):
     }
 
 
-def brier_score(probabilities, actual):
-    return sum(
-        (probabilities[outcome] - float(outcome == actual)) ** 2
-        for outcome in OUTCOMES
-    )
-
-
-def log_loss(probabilities, actual):
-    return -log(max(probabilities[actual], 1e-15))
 
 
 def main():
@@ -153,6 +151,11 @@ def main():
                 totals["baseline_brier"] += brier_score(baseline_probs, actual)
                 totals["model_log_loss"] += log_loss(model_probs, actual)
                 totals["baseline_log_loss"] += log_loss(baseline_probs, actual)
+
+                # Collect per-prediction records for calibration analysis.
+                if "calibration_records" not in totals:
+                    totals["calibration_records"] = []
+                totals["calibration_records"].append((model_probs, actual))
                 totals["evaluated"] += 1
 
         previous_matches.extend(date_matches)
@@ -175,6 +178,16 @@ def main():
     print(f"Model log loss:         {totals['model_log_loss'] / evaluated:.4f}")
     print(f"Baseline log loss:      {totals['baseline_log_loss'] / evaluated:.4f}")
     print(f"Exact score accuracy:   {totals['exact_scores'] / evaluated:.1%}")
+    print()
+    print("Model calibration (predicted probability bucket vs observed rate):")
+    print(f"{'Bucket':>10} {'Predicted':>10} {'Observed':>10} {'Samples':>8}")
+    for bucket in calibration_buckets(totals["calibration_records"]):
+        print(
+            f"{bucket['range']:>10} "
+            f"{bucket['predicted_rate']:>9.1%} "
+            f"{bucket['observed_rate']:>9.1%} "
+            f"{bucket['samples']:>8}"
+        )
 
 
 if __name__ == "__main__":

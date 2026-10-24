@@ -20,19 +20,29 @@ def load_data():
         # Exclude the known incomplete 2021/2022 import for now.
         historical = db.execute(
             """
-            SELECT match_date, home_team, away_team, home_goals, away_goals, is_final
-            FROM matches
-            WHERE provider = 'pitchapi'
-              AND league_name = ?
-              AND is_final = 1
-              AND home_goals IS NOT NULL
-              AND away_goals IS NOT NULL
-              AND season != '2021/2022'
-            ORDER BY match_date
-        """,
+    SELECT
+        m.match_date,
+        m.home_team,
+        m.away_team,
+        m.home_goals,
+        m.away_goals,
+        m.is_final,
+        f.home_xg,
+        f.away_xg
+    FROM matches AS m
+    LEFT JOIN match_features AS f
+      ON f.provider = m.provider
+     AND f.provider_match_id = m.provider_match_id
+    WHERE m.provider = 'pitchapi'
+      AND m.league_name = ?
+      AND m.is_final = 1
+      AND m.home_goals IS NOT NULL
+      AND m.away_goals IS NOT NULL
+      AND m.season != '2021/2022'
+    ORDER BY m.match_date
+    """,
             (LEAGUE,),
         ).fetchall()
-
         today = datetime.now(timezone.utc).date().isoformat()
 
         upcoming = db.execute(
@@ -57,6 +67,12 @@ def load_data():
 
 def main():
     historical, upcoming = load_data()
+    xg_count = sum(
+        match.get("home_xg") is not None and match.get("away_xg") is not None
+        for match in historical
+    )
+    print(f"Training matches: {len(historical)}")
+    print(f"Training matches with both xG values: {xg_count}/{len(historical)}")
 
     if not historical:
         raise SystemExit(

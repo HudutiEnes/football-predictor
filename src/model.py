@@ -7,7 +7,7 @@ match being predicted (the backtest does this by date group).
 
 from collections import defaultdict
 from datetime import date
-from math import exp, factorial
+from math import exp, factorial, log
 
 MAX_GOALS = 12
 PRIOR_MATCHES = 5
@@ -29,6 +29,65 @@ def parse_match_date(value):
 def poisson_probability(goals, expected):
     """Poisson probability for a non-negative goal count."""
     return exp(-expected) * expected**goals / factorial(goals)
+
+
+def brier_score(probabilities, actual):
+    """Multi-class Brier score for a 1X2 probability dict."""
+    return sum(
+        (probabilities[outcome] - float(outcome == actual)) ** 2
+        for outcome in probabilities
+    )
+
+
+def log_loss(probabilities, actual):
+    """Log loss for a 1X2 probability dict."""
+    return -log(max(probabilities[actual], 1e-15))
+
+
+def calibration_buckets(records, bins=5):
+    """Bin predicted 1X2 probabilities and compare to observed frequencies.
+
+    ``records`` is an iterable of ``(probabilities, actual_outcome)`` tuples,
+    where ``probabilities`` is a dict like {"home": 0.5, "draw": 0.25, "away": 0.25}.
+    Returns a list of dicts with predicted/observed rates and sample counts.
+    """
+    edges = [i / bins for i in range(bins + 1)]
+    buckets = [
+        {
+            "low": edges[i],
+            "high": edges[i + 1],
+            "predicted_sum": 0.0,
+            "observed_sum": 0.0,
+            "count": 0,
+        }
+        for i in range(bins)
+    ]
+
+    for probabilities, actual in records:
+        for outcome, probability in probabilities.items():
+            for bucket in buckets:
+                if bucket["low"] <= probability < bucket["high"] or (
+                    probability == 1.0 and bucket["high"] == 1.0
+                ):
+                    bucket["predicted_sum"] += probability
+                    bucket["observed_sum"] += float(outcome == actual)
+                    bucket["count"] += 1
+                    break
+
+    result = []
+    for bucket in buckets:
+        count = bucket["count"]
+        if count == 0:
+            continue
+        result.append(
+            {
+                "range": f"{bucket['low']:.0%} - {bucket['high']:.0%}",
+                "predicted_rate": bucket["predicted_sum"] / count,
+                "observed_rate": bucket["observed_sum"] / count,
+                "samples": count,
+            }
+        )
+    return result
 
 
 def _number_or_none(value):
