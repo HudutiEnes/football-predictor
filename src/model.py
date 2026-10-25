@@ -1,4 +1,4 @@
-"""Recency-weighted Poisson model with optional xG blending.
+"""Recency-weighted Poisson model with optional xG blending and Dixon-Coles correction.
 
 Only completed matches supplied to ``fit`` influence the model. The caller is
 responsible for supplying training matches that happened strictly before the
@@ -29,6 +29,79 @@ def parse_match_date(value):
 def poisson_probability(goals, expected):
     """Poisson probability for a non-negative goal count."""
     return exp(-expected) * expected**goals / factorial(goals)
+
+
+def poisson_grid(expected_home, expected_away, max_goals=MAX_GOALS):
+    """grid[h][a] = P(home scores h) * P(away scores a) under independent Poisson goals."""
+    home_probs = [poisson_probability(g, expected_home) for g in range(max_goals + 1)]
+    away_probs = [poisson_probability(g, expected_away) for g in range(max_goals + 1)]
+    return [[hp * ap for ap in away_probs] for hp in home_probs]
+
+
+def rho_bounds(expected_home, expected_away):
+    """Range of the Dixon-Coles rho for which all four adjusted cells stay positive."""
+    lower = max(-1.0 / expected_home, -1.0 / expected_away)
+    upper = min(1.0, 1.0 / (expected_home * expected_away))
+    return lower, upper
+
+
+def dixon_coles_tau(home_goals, away_goals, expected_home, expected_away, rho):
+    """Dixon-Coles low-score adjustment factor for one scoreline (1.0 for every other score)."""
+    if home_goals == 0 and away_goals == 0:
+        return 1.0 - expected_home * expected_away * rho
+    if home_goals == 0 and away_goals == 1:
+        return 1.0 + expected_home * rho
+    if home_goals == 1 and away_goals == 0:
+        return 1.0 + expected_away * rho
+    if home_goals == 1 and away_goals == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def apply_dixon_coles(grid, expected_home, expected_away, rho):
+    """Return a copy of ``grid`` with the 0-0, 1-0, 0-1 and 1-1 cells adjusted.
+
+    The four adjustments cancel exactly, so the total probability mass is unchanged. rho is
+    clipped to the range that keeps every cell positive for these particular goal rates.
+    """
+    lower, upper = rho_bounds(expected_home, expected_away)
+    rho = min(max(rho, lower + 1e-6), upper - 1e-6)
+    adjusted = [row[:] for row in grid]
+    for h in (0, 1):
+        for a in (0, 1):
+            adjusted[h][a] = grid[h][a] * dixon_coles_tau(
+                h, a, expected_home, expected_away, rho
+            )
+    return adjusted
+
+
+def market_probabilities(grid):
+    """BTTS, over/under and clean-sheet probabilities from a scoreline grid (renormalised)."""
+    total = sum(sum(row) for row in grid)
+    both_score = home_clean = away_clean = expected_total = 0.0
+    over = {1.5: 0.0, 2.5: 0.0, 3.5: 0.0}
+    for h, row in enumerate(grid):
+        for a, value in enumerate(row):
+            p = value / total
+            if h > 0 and a > 0:
+                both_score += p
+            if a == 0:
+                home_clean += p  # home team kept a clean sheet
+            if h == 0:
+                away_clean += p
+            for line in over:
+                if h + a > line:
+                    over[line] += p
+            expected_total += (h + a) * p
+    return {
+        "both_teams_score_probability": both_score,
+        "over_1_5_probability": over[1.5],
+        "over_2_5_probability": over[2.5],
+        "over_3_5_probability": over[3.5],
+        "home_clean_sheet_probability": home_clean,
+        "away_clean_sheet_probability": away_clean,
+        "expected_total_goals": expected_total,
+    }
 
 
 def brier_score(probabilities, actual):
@@ -124,6 +197,7 @@ class FootballModel:
         half_life_days=DEFAULT_HALF_LIFE_DAYS,
         xg_weight=DEFAULT_XG_WEIGHT,
         prior_matches=PRIOR_MATCHES,
+        dixon_coles=False,
     ):
         if half_life_days <= 0:
             raise ValueError("half_life_days must be greater than zero")
@@ -140,11 +214,14 @@ class FootballModel:
         self.away_avg = 1.15
         self.trained_matches = 0
         self.latest_training_date = None
+        self.dixon_coles = bool(dixon_coles)
+        self.rho = 0.0
 
     def fit(self, matches):
         """Fit on completed matches, applying recency weights and xG blending."""
         eligible = [
-            m for m in matches
+            m
+            for m in matches
             if m.get("is_final")
             and m.get("home_goals") is not None
             and m.get("away_goals") is not None
@@ -232,18 +309,18 @@ class FootballModel:
             home_played = team_stats["home_played"]
             away_played = team_stats["away_played"]
 
-            home_scoring = (
-                team_stats["home_scored"] + prior * self.home_avg
-            ) / (home_played + prior)
-            home_conceding = (
-                team_stats["home_conceded"] + prior * self.away_avg
-            ) / (home_played + prior)
-            away_scoring = (
-                team_stats["away_scored"] + prior * self.away_avg
-            ) / (away_played + prior)
-            away_conceding = (
-                team_stats["away_conceded"] + prior * self.home_avg
-            ) / (away_played + prior)
+            home_scoring = (team_stats["home_scored"] + prior * self.home_avg) / (
+                home_played + prior
+            )
+            home_conceding = (team_stats["home_conceded"] + prior * self.away_avg) / (
+                home_played + prior
+            )
+            away_scoring = (team_stats["away_scored"] + prior * self.away_avg) / (
+                away_played + prior
+            )
+            away_conceding = (team_stats["away_conceded"] + prior * self.home_avg) / (
+                away_played + prior
+            )
 
             self.teams[team] = {
                 "home_attack": home_scoring / self.home_avg,
@@ -252,10 +329,56 @@ class FootballModel:
                 "away_defence": away_conceding / self.home_avg,
             }
 
+        self.rho = self._estimate_rho(enriched) if self.dixon_coles else 0.0
         return self
 
-    def predict(self, home_team, away_team):
-        """Return goal expectations, 1X2 probabilities and likely scorelines."""
+    def _estimate_rho(self, enriched, minimum_low_scoring_matches=50):
+        """Maximum-likelihood Dixon-Coles rho from the training matches (0.0 if too little data).
+
+        Only 0-0, 1-0, 0-1 and 1-1 matches depend on rho, and the adjustment preserves total
+        probability, so the likelihood reduces to a sum of log(tau) over those matches. That
+        function is concave in rho, so a golden-section search finds the maximum."""
+        low = []
+        for match, weight, _, _ in enriched:
+            home_goals, away_goals = int(match["home_goals"]), int(match["away_goals"])
+            if home_goals <= 1 and away_goals <= 1:
+                expected_home, expected_away = self.expected_goals(
+                    match["home_team"], match["away_team"]
+                )
+                low.append(
+                    (home_goals, away_goals, expected_home, expected_away, weight)
+                )
+        if len(low) < minimum_low_scoring_matches:
+            return 0.0
+
+        lower = max([-0.5] + [rho_bounds(eh, ea)[0] for _, _, eh, ea, _ in low]) + 1e-4
+        upper = min([0.5] + [rho_bounds(eh, ea)[1] for _, _, eh, ea, _ in low]) - 1e-4
+        if lower >= upper:
+            return 0.0
+
+        def log_likelihood(rho):
+            return sum(
+                w * log(max(dixon_coles_tau(h, a, eh, ea, rho), 1e-12))
+                for h, a, eh, ea, w in low
+            )
+
+        golden = 0.6180339887498949
+        left, right = lower, upper
+        x1, x2 = right - golden * (right - left), left + golden * (right - left)
+        f1, f2 = log_likelihood(x1), log_likelihood(x2)
+        for _ in range(60):
+            if f1 < f2:
+                left, x1, f1 = x1, x2, f2
+                x2 = left + golden * (right - left)
+                f2 = log_likelihood(x2)
+            else:
+                right, x2, f2 = x2, x1, f1
+                x1 = right - golden * (right - left)
+                f1 = log_likelihood(x1)
+        return (left + right) / 2.0
+
+    def expected_goals(self, home_team, away_team):
+        """Expected goals for both sides (clipped to a sane range)."""
         home = self.teams.get(home_team, {})
         away = self.teams.get(away_team, {})
 
@@ -267,21 +390,28 @@ class FootballModel:
         )
         expected_home = min(max(expected_home, 0.05), 6.0)
         expected_away = min(max(expected_away, 0.05), 6.0)
+        return expected_home, expected_away
 
-        home_probs = [
-            poisson_probability(goals, expected_home)
-            for goals in range(MAX_GOALS + 1)
-        ]
-        away_probs = [
-            poisson_probability(goals, expected_away)
-            for goals in range(MAX_GOALS + 1)
-        ]
+    def score_grid(self, home_team, away_team):
+        """Scoreline probability grid. Returns (expected_home, expected_away, grid).
+
+        grid[h][a] is the probability of the score h-a (not yet renormalised: the grid is
+        truncated at MAX_GOALS, so it sums to slightly less than 1). When Dixon-Coles is enabled
+        the four lowest scorelines are adjusted by the fitted rho."""
+        expected_home, expected_away = self.expected_goals(home_team, away_team)
+        grid = poisson_grid(expected_home, expected_away)
+        if self.dixon_coles and self.rho:
+            grid = apply_dixon_coles(grid, expected_home, expected_away, self.rho)
+        return expected_home, expected_away, grid
+
+    def predict(self, home_team, away_team):
+        """Return goal expectations, 1X2 probabilities, likely scorelines and goal markets."""
+        expected_home, expected_away, grid = self.score_grid(home_team, away_team)
 
         outcomes = {"home": 0.0, "draw": 0.0, "away": 0.0}
         scores = []
-        for home_goals, home_probability in enumerate(home_probs):
-            for away_goals, away_probability in enumerate(away_probs):
-                probability = home_probability * away_probability
+        for home_goals, row in enumerate(grid):
+            for away_goals, probability in enumerate(row):
                 scores.append((home_goals, away_goals, probability))
                 if home_goals > away_goals:
                     outcomes["home"] += probability
@@ -294,8 +424,9 @@ class FootballModel:
         # probabilities sum to exactly 1 within floating-point precision.
         outcome_total = sum(outcomes.values())
         scores.sort(key=lambda item: item[2], reverse=True)
+        markets = market_probabilities(grid)
 
-        return {
+        prediction = {
             "home_team": home_team,
             "away_team": away_team,
             "expected_home_goals": round(expected_home, 2),
@@ -312,3 +443,9 @@ class FootballModel:
                 for home_goals, away_goals, probability in scores[:5]
             ],
         }
+        for key, value in markets.items():
+            prediction[key] = (
+                round(value, 4) if key != "expected_total_goals" else round(value, 2)
+            )
+        prediction["dixon_coles_rho"] = round(self.rho, 4) if self.dixon_coles else None
+        return prediction
